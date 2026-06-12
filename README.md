@@ -3,9 +3,11 @@
 Minimal reproduction for https://github.com/sveltejs/svelte-eslint-parser/issues/917
 
 In a monorepo where the package's `eslint.config.js` imports a shared root config
-(`import rootConfig from '../eslint.config.js'`), the type of a store subscription
-(`$data`) fails to resolve in `.svelte` templates: `{#each $data.tags as tag}` infers
-`tag` as `unknown` and `@typescript-eslint/no-unsafe-member-access` reports
+(`import rootConfig from '../eslint.config.js'`) and the svelte block uses
+`tseslint.parser` (the `typescript-eslint` meta-package re-export), the type of a
+store subscription (`$data`) fails to resolve in `.svelte` templates:
+`{#each $data.tags as tag}` infers `tag` as `unknown` and
+`@typescript-eslint/no-unsafe-member-access` reports
 "member access .tags on a type that cannot be resolved".
 
 ## Steps
@@ -28,20 +30,39 @@ pkg/src/repro.svelte
   8:13  error  Invalid type "unknown" of template literal expression         @typescript-eslint/restrict-template-expressions
 ```
 
-## Trigger
+## Root cause (summary)
 
-The bug is triggered by the `import rootConfig from '../eslint.config.js'` line in
-[`pkg/eslint.config.js`](./pkg/eslint.config.js):
+1. typescript-eslint v8's `configs` getter registers the directory of any stack
+   frame named `eslint.config.*` as a candidate `tsconfigRootDir` on every
+   `tseslint.configs.*` access. With a root config and a package config, **two
+   candidates** get registered.
+2. svelte-eslint-parser's `isTSESLintParserObject` probes the parser with
+   `value.parseForESLint("", {})` — empty options, no `tsconfigRootDir`.
+3. typescript-estree's `getInferredTSConfigRootDir()` **throws** when there are
+   two candidates and no explicit `tsconfigRootDir`.
+4. The probe's `catch { return false; }` swallows the error, the parser is
+   misclassified as "not @typescript-eslint/parser", and template-side type
+   integration is silently disabled.
 
-- Remove that import (and use `ts.configs.recommendedTypeChecked` directly in `extends`) → **no errors**.
-- Keep the import but don't use `rootConfig` anywhere (pure side-effect import) → **errors come back**.
+The probe only runs because `tseslint.parser` is a thin wrapper exposing just
+`parseForESLint` and `meta`, so the non-throwing duck-type check
+(`maybeTSESLintParserObject`, which looks for `parse` / `createProgram` /
+`clearCaches` / `version`) fails first.
 
-So loading the root flat-config module is what breaks the store type resolution,
-not the contents of the resulting ESLint config.
+## Knobs that flip the bug (all verified)
 
-## Notes
+| Change | Result |
+| --- | --- |
+| Use raw `@typescript-eslint/parser` instead of `tseslint.parser` | fixed (duck check passes, probe never runs) |
+| Rename root config to `eslint.base.js` | fixed (only one candidate registered) |
+| Root config stops accessing `tseslint.configs.*` | fixed (only one candidate) |
+| Patch probe to `parseForESLint("", { tsconfigRootDir: process.cwd() })` | fixed |
+| Make the root config import a pure side-effect (`rootConfig` unused) | still broken |
+| Set `tsconfigRootDir` explicitly in any/all configs | still broken (probe uses its own empty options) |
+| Install `svelte` at the workspace root | still broken |
+| Upgrade ESLint 9 → 10 | still broken |
 
-- Accessing the same expression in a mustache tag (`{$data.tags[0]}`) resolves to `string` even when the bug is active — only the `{#each}` item is affected by the `unknown` inference (the `no-unsafe-member-access` report appears on the each source).
-- Copying the array with a spread (`{#each [...$data.tags] as tag}`) is a workaround.
-- Extracting with `$derived($data.tags)` does NOT help; `$derived([...$data.tags])` does.
-- Does not reproduce in a single-package (non-monorepo) setup.
+## Workarounds
+
+- **Recommended:** pass the raw parser: `import tsParser from '@typescript-eslint/parser'` and use `parserOptions: { parser: tsParser }` in the svelte block.
+- Alternative: rename the shared root config so its filename doesn't match `eslint.config.*` (e.g. `eslint.base.js`).
