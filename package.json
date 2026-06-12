@@ -1,0 +1,10 @@
+{
+  "name": "repro-root",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "eslint": "9.39.4",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.61.0"
+  }
+}
